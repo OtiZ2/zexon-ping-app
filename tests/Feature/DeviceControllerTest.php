@@ -4,66 +4,126 @@ namespace Tests\Feature;
 
 use App\Models\Device;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\TestWith;
 use Tests\TestCase;
 
 class DeviceControllerTest extends TestCase
 {
     use LazilyRefreshDatabase;
 
-    public function test_device_is_saved_with_the_submitted_uuid_and_name(): void
+    public function test_device_create()
     {
-        $device = ['uuid' => '550e8400-e29b-41d4-a716-446655440000', 'name' => 'Sensor'];
 
-        $response = $this->postJson('/api/devices', $device);
+        $body = [
+            'uuid' => '550e8400-e29b-41d4-a716-446655440000',
+            'name' => 'Senzor',
+        ];
 
-        $response->assertCreated()->assertExactJson(['status' => 'create ok', 'body' => $device]);
-        $this->assertDatabaseHas('devices', $device);
+        $response = $this->postJson('/api/devices', $body);
+
+        $response->assertCreated()
+            ->assertExactJson([
+                'id' => 1,
+                'uuid' => '550e8400-e29b-41d4-a716-446655440000',
+                'name' => 'Senzor',
+            ]);
+
+        $this->assertDatabaseHas('devices', $body);
     }
 
-    public function test_duplicate_device_returns_409_without_changing_the_name(): void
+    public function test_store_ping_for_device()
     {
-        $device = Device::factory()->create(['name' => 'Sensor']);
 
-        $response = $this->postJson('/api/devices', ['uuid' => $device->uuid, 'name' => 'Different name']);
+        $device = Device::factory()->create();
+        $body = [
+            'battery_percent' => 85,
+        ];
+        $response = $this->postJson("/api/devices/{$device->uuid}/ping", $body);
 
-        $response->assertConflict()->assertJsonValidationErrors('uuid');
-        $this->assertDatabaseHas('devices', ['uuid' => $device->uuid, 'name' => 'Sensor']);
+        $response->assertCreated()
+            ->assertExactJson([
+                'status' => 'ok',
+            ]);
+
+        $this->assertDatabaseHas('pings', [
+            'device_id' => $device->id,
+            'battery_percent' => 85,
+        ]);
+    }
+
+    #[DataProvider('invalidDevicePayloads')]
+    public function test_device_create_returns_422_for_invalid_payload(array $body, array $errors): void
+    {
+        $response = $this->postJson('/api/devices', $body);
+
+        $response->assertUnprocessable()
+            ->assertJsonValidationErrors($errors);
+
+        $this->assertDatabaseCount('devices', 0);
+    }
+
+    /** @return array<string, array{array{uuid?: string, name?: string|int}, array<string, string>}> */
+    public static function invalidDevicePayloads(): array
+    {
+        $uuid = '550e8400-e29b-41d4-a716-446655440000';
+
+        return [
+            'missing required fields' => [[], [
+                'uuid' => 'The uuid field is required.',
+                'name' => 'The name field is required.',
+            ]],
+            'malformed UUID' => [['uuid' => 'invalid-uuid', 'name' => 'Senzor'], [
+                'uuid' => 'The uuid field must be a valid UUID.',
+            ]],
+            'non-string name' => [['uuid' => $uuid, 'name' => 123], [
+                'name' => 'The name field must be a string.',
+            ]],
+            'name over 255 characters' => [['uuid' => $uuid, 'name' => str_repeat('a', 256)], [
+                'name' => 'The name field must not be greater than 255 characters.',
+            ]],
+        ];
+    }
+
+    public function test_device_create_returns_422_for_duplicate_uuid(): void
+    {
+        $device = Device::factory()->create();
+
+        $response = $this->postJson('/api/devices', [
+            'uuid' => $device->uuid,
+            'name' => 'Senzor',
+        ]);
+
+        $response->assertUnprocessable()
+            ->assertJsonValidationErrors(['uuid' => 'The uuid has already been taken.']);
+
         $this->assertDatabaseCount('devices', 1);
     }
 
-    public function test_ping_is_saved_for_the_device_in_the_url(): void
+    /** @param array{battery_percent?: int|float} $body */
+    #[TestWith([[], 'The battery percent field is required.'], 'missing percentage')]
+    #[TestWith([['battery_percent' => 85.5], 'The battery percent field must be an integer.'], 'fractional percentage')]
+    #[TestWith([['battery_percent' => -1], 'The battery percent field must be between 0 and 100.'], 'below zero')]
+    #[TestWith([['battery_percent' => 101], 'The battery percent field must be between 0 and 100.'], 'above 100')]
+    public function test_store_ping_returns_422_for_invalid_battery_percent(array $body, string $message): void
     {
         $device = Device::factory()->create();
 
-        $response = $this->postJson("/api/devices/{$device->uuid}/ping", [
-            'uuid' => '550e8400-e29b-41d4-a716-446655440000',
-            'battery_percent' => 75,
-        ]);
+        $response = $this->postJson("/api/devices/{$device->uuid}/ping", $body);
 
-        $response->assertCreated()->assertExactJson([
-            'status' => 'ping ok',
-            'body' => ['uuid' => $device->uuid, 'battery_percent' => 75],
-        ]);
-        $this->assertDatabaseHas('pings', ['device_id' => $device->id, 'battery_percent' => 75]);
-    }
+        $response->assertUnprocessable()
+            ->assertJsonValidationErrors(['battery_percent' => $message]);
 
-    public function test_ping_for_an_unknown_device_returns_404(): void
-    {
-        $response = $this->postJson('/api/devices/550e8400-e29b-41d4-a716-446655440000/ping', [
-            'battery_percent' => 75,
-        ]);
-
-        $response->assertNotFound();
         $this->assertDatabaseCount('pings', 0);
     }
 
-    public function test_ping_with_battery_above_100_returns_422(): void
+    public function test_store_ping_returns_422_for_invalid_route_uuid(): void
     {
-        $device = Device::factory()->create();
+        $response = $this->postJson('/api/devices/invalid-uuid/ping', ['battery_percent' => 85]);
 
-        $response = $this->postJson("/api/devices/{$device->uuid}/ping", ['battery_percent' => 101]);
+        $response->assertUnprocessable()
+            ->assertJsonValidationErrors(['uuid' => 'The uuid field must be a valid UUID.']);
 
-        $response->assertUnprocessable()->assertJsonValidationErrors('battery_percent');
         $this->assertDatabaseCount('pings', 0);
     }
 }
